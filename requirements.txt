@@ -1,0 +1,12 @@
+polars
+pandas
+numpy
+lightgbm
+catboost
+xgboost
+scikit-learn
+category-encoders
+optuna
+matplotlib
+seaborn
+streamlit
