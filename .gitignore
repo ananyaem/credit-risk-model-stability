@@ -1,5 +1,7 @@
 guidelines
 .DS_Store
+*.zip
+*.parquet
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
