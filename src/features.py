@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import numpy as np
 import polars as pl
 
 NUMERIC_DTYPES = frozenset({
@@ -275,3 +276,117 @@ def aggregate_depth2(df: pl.DataFrame) -> pl.DataFrame:
         f"→ {result.shape[1] - 1} features, {result.height:,} rows"
     )
     return result
+
+
+# ─────────────────────────────────────────────────────────────────
+#  Post-merge filtering
+# ─────────────────────────────────────────────────────────────────
+
+def drop_correlated_columns(
+    df: pl.DataFrame,
+    threshold: float = 0.95,
+    protect: set[str] | None = None,
+    sample_n: int = 50_000,
+) -> pl.DataFrame:
+    """
+    Drop one column from each pair whose |Pearson r| exceeds *threshold*.
+
+    When two columns are highly correlated the one with the **higher** null
+    rate is dropped.  A random sample of *sample_n* rows is used so the
+    correlation matrix stays cheap to compute.
+    """
+    protect = protect or {"case_id", "target", "WEEK_NUM"}
+
+    num_cols = [
+        c for c in df.columns
+        if df[c].dtype in NUMERIC_DTYPES and c not in protect
+    ]
+    if len(num_cols) < 2:
+        return df
+
+    sub = df.select(num_cols)
+    if sub.height > sample_n:
+        sub = sub.sample(n=sample_n, seed=42)
+
+    mat = sub.fill_null(0).to_numpy().astype(np.float32)
+
+    with np.errstate(invalid="ignore"):
+        corr = np.abs(np.corrcoef(mat, rowvar=False))
+    np.nan_to_num(corr, copy=False, nan=0.0)
+
+    null_rates = np.array([df[c].null_count() / df.height for c in num_cols])
+
+    to_drop_idx: set[int] = set()
+    n = len(num_cols)
+    for i in range(n):
+        if i in to_drop_idx:
+            continue
+        for j in range(i + 1, n):
+            if j in to_drop_idx:
+                continue
+            if corr[i, j] > threshold:
+                if null_rates[i] >= null_rates[j]:
+                    to_drop_idx.add(i)
+                    break
+                else:
+                    to_drop_idx.add(j)
+
+    drop_names = sorted(num_cols[i] for i in to_drop_idx)
+    print(
+        f"[drop_correlated] Dropped {len(drop_names)} of {n} numeric "
+        f"columns (|r| > {threshold})"
+    )
+    return df.drop(drop_names) if drop_names else df
+
+
+def collapse_rare_categories(
+    df: pl.DataFrame,
+    max_unique: int = 200,
+    keep_top: int = 20,
+) -> pl.DataFrame:
+    """
+    For string columns with more than *max_unique* unique values, keep only
+    the *keep_top* most frequent values and set the rest to null.
+    """
+    exprs: list[pl.Expr] = []
+
+    for col in df.columns:
+        if df[col].dtype not in STRING_DTYPES:
+            continue
+        n_uniq = df[col].n_unique()
+        if n_uniq <= max_unique:
+            continue
+
+        top_vals = (
+            df[col]
+            .value_counts()
+            .sort("count", descending=True)
+            .head(keep_top)
+            [col]
+            .to_list()
+        )
+        exprs.append(
+            pl.when(pl.col(col).is_in(top_vals))
+            .then(pl.col(col))
+            .otherwise(None)
+            .alias(col)
+        )
+        print(f"  [collapse_rare] {col}: {n_uniq} → {keep_top} categories")
+
+    if exprs:
+        df = df.with_columns(exprs)
+    return df
+
+
+def remove_drift_features(
+    df: pl.DataFrame,
+    features_to_drop: list[str],
+) -> pl.DataFrame:
+    """Drop manually identified drift-prone features."""
+    to_drop = [c for c in features_to_drop if c in df.columns]
+    if to_drop:
+        print(
+            f"[remove_drift] Dropped {len(to_drop)} of "
+            f"{len(features_to_drop)} drift-prone features"
+        )
+    return df.drop(to_drop)
