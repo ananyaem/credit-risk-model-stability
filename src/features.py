@@ -1,6 +1,15 @@
 """Feature engineering utilities for Home Credit data."""
 
+from __future__ import annotations
+
 import polars as pl
+
+NUMERIC_DTYPES = frozenset({
+    pl.Int8, pl.Int16, pl.Int32, pl.Int64,
+    pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64,
+    pl.Float32, pl.Float64,
+})
+STRING_DTYPES = frozenset({pl.String, pl.Utf8, pl.Categorical})
 
 
 def handle_dates(df: pl.DataFrame) -> pl.DataFrame:
@@ -104,3 +113,97 @@ def create_domain_ratios(df: pl.DataFrame) -> pl.DataFrame:
         df = df.with_columns(ratio_exprs)
 
     return df
+
+
+def aggregate_depth1(
+    df: pl.DataFrame,
+    group_col: str = "case_id",
+) -> pl.DataFrame:
+    """
+    Aggregate a depth-1 table by *group_col* after sorting by num_group1.
+
+    Aggregation rules
+    -----------------
+    * Numeric columns          → mean, max, min, first, last, std
+    * Amount columns (suffix A)→ additionally coefficient of variation (std / |mean|)
+    * String cols  (≤200 uniq) → mode, n_unique
+    * Categoricals (≤10 uniq, <0.9 null rate) → per-value occurrence counts
+    """
+    skip = {group_col, "num_group1", "num_group2"}
+
+    if "num_group1" in df.columns:
+        df = df.sort(group_col, "num_group1")
+
+    n_rows = df.height
+
+    # ── classify columns ────────────────────────────────────────────
+    numeric_cols: list[str] = []
+    amount_cols: list[str] = []
+    string_mode_cols: list[str] = []
+    cat_count_map: dict[str, list[str]] = {}
+
+    for col in df.columns:
+        if col in skip:
+            continue
+        dtype = df[col].dtype
+
+        if dtype in NUMERIC_DTYPES:
+            numeric_cols.append(col)
+            if col.endswith("A"):
+                amount_cols.append(col)
+
+        elif dtype in STRING_DTYPES:
+            n_uniq = df[col].n_unique()
+            null_rate = df[col].null_count() / n_rows if n_rows > 0 else 1.0
+
+            if n_uniq <= 200:
+                string_mode_cols.append(col)
+
+            if n_uniq <= 10 and null_rate < 0.9:
+                cat_count_map[col] = df[col].drop_nulls().unique().to_list()
+
+    # ── build aggregation expressions ───────────────────────────────
+    agg_exprs: list[pl.Expr] = []
+
+    for col in numeric_cols:
+        agg_exprs.extend([
+            pl.col(col).mean().alias(f"{col}_mean"),
+            pl.col(col).max().alias(f"{col}_max"),
+            pl.col(col).min().alias(f"{col}_min"),
+            pl.col(col).first().alias(f"{col}_first"),
+            pl.col(col).last().alias(f"{col}_last"),
+            pl.col(col).std().alias(f"{col}_std"),
+        ])
+
+    for col in amount_cols:
+        agg_exprs.append(
+            (pl.col(col).std() / (pl.col(col).mean().abs() + 1e-9))
+            .alias(f"{col}_cv")
+        )
+
+    for col in string_mode_cols:
+        agg_exprs.extend([
+            pl.col(col).drop_nulls().mode().first().alias(f"{col}_mode"),
+            pl.col(col).n_unique().alias(f"{col}_nunique"),
+        ])
+
+    for col, vals in cat_count_map.items():
+        for val in vals:
+            safe = str(val).replace(" ", "_").replace("/", "_")
+            agg_exprs.append(
+                (pl.col(col) == val).sum().alias(f"{col}_{safe}_count")
+            )
+
+    if not agg_exprs:
+        return df.select(group_col).unique()
+
+    result = df.group_by(group_col).agg(agg_exprs)
+
+    print(
+        f"[aggregate_depth1] {len(numeric_cols)} numeric "
+        f"({len(amount_cols)} amount w/ CV), "
+        f"{len(string_mode_cols)} string (mode/nunique), "
+        f"{len(cat_count_map)} categorical (value counts) "
+        f"→ {result.shape[1] - 1} features"
+    )
+    return result
