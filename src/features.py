@@ -115,28 +115,16 @@ def create_domain_ratios(df: pl.DataFrame) -> pl.DataFrame:
     return df
 
 
-def aggregate_depth1(
+def _build_agg_exprs(
     df: pl.DataFrame,
-    group_col: str = "case_id",
-) -> pl.DataFrame:
+    skip: set[str],
+) -> tuple[list[pl.Expr], dict[str, int]]:
+    """Classify columns and return (agg_exprs, stats).
+
+    Shared by aggregate_depth1 and aggregate_depth2.
     """
-    Aggregate a depth-1 table by *group_col* after sorting by num_group1.
-
-    Aggregation rules
-    -----------------
-    * Numeric columns          → mean, max, min, first, last, std
-    * Amount columns (suffix A)→ additionally coefficient of variation (std / |mean|)
-    * String cols  (≤200 uniq) → mode, n_unique
-    * Categoricals (≤10 uniq, <0.9 null rate) → per-value occurrence counts
-    """
-    skip = {group_col, "num_group1", "num_group2"}
-
-    if "num_group1" in df.columns:
-        df = df.sort(group_col, "num_group1")
-
     n_rows = df.height
 
-    # ── classify columns ────────────────────────────────────────────
     numeric_cols: list[str] = []
     amount_cols: list[str] = []
     string_mode_cols: list[str] = []
@@ -162,7 +150,6 @@ def aggregate_depth1(
             if n_uniq <= 10 and null_rate < 0.9:
                 cat_count_map[col] = df[col].drop_nulls().unique().to_list()
 
-    # ── build aggregation expressions ───────────────────────────────
     agg_exprs: list[pl.Expr] = []
 
     for col in numeric_cols:
@@ -194,16 +181,97 @@ def aggregate_depth1(
                 (pl.col(col) == val).sum().alias(f"{col}_{safe}_count")
             )
 
+    stats = {
+        "numeric": len(numeric_cols),
+        "amount_cv": len(amount_cols),
+        "string_mode": len(string_mode_cols),
+        "cat_count": len(cat_count_map),
+    }
+    return agg_exprs, stats
+
+
+# ─────────────────────────────────────────────────────────────────
+#  Public aggregation functions
+# ─────────────────────────────────────────────────────────────────
+
+def aggregate_depth1(
+    df: pl.DataFrame,
+    group_col: str = "case_id",
+) -> pl.DataFrame:
+    """
+    Aggregate a depth-1 table by *group_col* after sorting by num_group1.
+
+    Aggregation rules
+    -----------------
+    * Numeric columns          → mean, max, min, first, last, std
+    * Amount columns (suffix A)→ additionally coefficient of variation (std / |mean|)
+    * String cols  (≤200 uniq) → mode, n_unique
+    * Categoricals (≤10 uniq, <0.9 null rate) → per-value occurrence counts
+    """
+    skip = {group_col, "num_group1", "num_group2"}
+
+    if "num_group1" in df.columns:
+        df = df.sort(group_col, "num_group1")
+
+    agg_exprs, stats = _build_agg_exprs(df, skip)
+
     if not agg_exprs:
         return df.select(group_col).unique()
 
     result = df.group_by(group_col).agg(agg_exprs)
 
     print(
-        f"[aggregate_depth1] {len(numeric_cols)} numeric "
-        f"({len(amount_cols)} amount w/ CV), "
-        f"{len(string_mode_cols)} string (mode/nunique), "
-        f"{len(cat_count_map)} categorical (value counts) "
+        f"[aggregate_depth1] {stats['numeric']} numeric "
+        f"({stats['amount_cv']} amount w/ CV), "
+        f"{stats['string_mode']} string (mode/nunique), "
+        f"{stats['cat_count']} categorical (value counts) "
         f"→ {result.shape[1] - 1} features"
+    )
+    return result
+
+
+def aggregate_depth2(df: pl.DataFrame) -> pl.DataFrame:
+    """
+    Two-pass aggregation for depth-2 tables.
+
+    Pass 1: group by (case_id, num_group1) — collapses the num_group2 dimension.
+    Pass 2: group by case_id               — collapses the num_group1 dimension.
+
+    Both passes use the same aggregation rules as aggregate_depth1.
+    """
+    # ── pass 1: collapse num_group2 ─────────────────────────────────
+    skip1 = {"case_id", "num_group1", "num_group2"}
+
+    if "num_group2" in df.columns:
+        df = df.sort("case_id", "num_group1", "num_group2")
+
+    agg1, stats1 = _build_agg_exprs(df, skip1)
+
+    if not agg1:
+        return df.select("case_id").unique()
+
+    pass1 = df.group_by(["case_id", "num_group1"]).agg(agg1)
+
+    print(
+        f"[aggregate_depth2] pass 1 (by case_id, num_group1): "
+        f"{stats1['numeric']} numeric, {stats1['string_mode']} string "
+        f"→ {pass1.shape[1] - 2} features, {pass1.height:,} rows"
+    )
+
+    # ── pass 2: collapse num_group1 ─────────────────────────────────
+    skip2 = {"case_id", "num_group1"}
+    pass1 = pass1.sort("case_id", "num_group1")
+
+    agg2, stats2 = _build_agg_exprs(pass1, skip2)
+
+    if not agg2:
+        return pass1.select("case_id").unique()
+
+    result = pass1.group_by("case_id").agg(agg2)
+
+    print(
+        f"[aggregate_depth2] pass 2 (by case_id): "
+        f"{stats2['numeric']} numeric, {stats2['string_mode']} string "
+        f"→ {result.shape[1] - 1} features, {result.height:,} rows"
     )
     return result
