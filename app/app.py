@@ -6,6 +6,8 @@ Run from the project root:
 
 from __future__ import annotations
 
+import json
+import pickle
 import sys
 from pathlib import Path
 
@@ -530,13 +532,220 @@ def page_model_stability() -> None:
 
 
 # ═════════════════════════════════════════════════════════════════
+#  Page 3 — Risk Predictor
+# ═════════════════════════════════════════════════════════════════
+
+RISK_TIERS = [
+    (0.05, "Very Low", GREEN),
+    (0.15, "Low", "#8BC34A"),
+    (0.30, "Medium", ORANGE),
+    (0.50, "High", "#FF5722"),
+    (1.01, "Very High", RED),
+]
+
+
+@st.cache_resource(show_spinner="Loading CatBoost models ...")
+def load_catboost_models():
+    """Load tuned CatBoost fold models + feature config.
+
+    Returns (models, feature_cols, cat_cols) or (None, None, None).
+    """
+    from catboost import CatBoostClassifier
+
+    tuned_dir = ARTIFACTS_PATH / "tuned"
+    config_path = tuned_dir / "feature_config.json"
+
+    if not config_path.exists():
+        return None, None, None
+
+    with open(config_path) as f:
+        config = json.load(f)
+
+    feature_cols: list[str] = config["catboost"]["feature_cols"]
+    cat_cols: list[str] = config["catboost"]["cat_cols"]
+
+    models: list = []
+    for i in range(5):
+        p = tuned_dir / f"catboost_fold_{i}.cbm"
+        if not p.exists():
+            continue
+        m = CatBoostClassifier()
+        m.load_model(str(p))
+        models.append(m)
+
+    if not models:
+        return None, None, None
+    return models, feature_cols, cat_cols
+
+
+def _risk_tier(prob: float) -> tuple[str, str]:
+    """Return (tier_label, colour) for a default probability."""
+    for threshold, label, colour in RISK_TIERS:
+        if prob < threshold:
+            return label, colour
+    return RISK_TIERS[-1][1], RISK_TIERS[-1][2]
+
+
+def page_risk_predictor() -> None:
+    st.title("Risk Predictor")
+    st.caption(
+        "Enter applicant financial details to get a predicted default "
+        "probability and risk tier from the trained CatBoost ensemble."
+    )
+
+    models, feature_cols, cat_cols = load_catboost_models()
+
+    if models is None:
+        st.warning(
+            "Model artifacts not found. Run the training pipeline first to "
+            "generate `artifacts/tuned/catboost_fold_*.cbm` and "
+            "`feature_config.json`."
+        )
+        return
+
+    st.info(
+        f"Loaded **{len(models)}** CatBoost fold models "
+        f"({len(feature_cols)} features, {len(cat_cols)} categorical)."
+    )
+
+    # ── Input form ────────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("Applicant Details")
+
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        credit_amount = st.number_input(
+            "Credit amount requested",
+            min_value=0.0, value=100_000.0, step=10_000.0, format="%.0f",
+        )
+        annuity = st.number_input(
+            "Monthly annuity payment",
+            min_value=0.0, value=5_000.0, step=500.0, format="%.0f",
+        )
+
+    with col2:
+        price = st.number_input(
+            "Price of goods",
+            min_value=0.0, value=120_000.0, step=10_000.0, format="%.0f",
+        )
+        total_debt = st.number_input(
+            "Total existing debt",
+            min_value=0.0, value=50_000.0, step=10_000.0, format="%.0f",
+        )
+
+    with col3:
+        disbursed = st.number_input(
+            "Disbursed credit amount",
+            min_value=0.0, value=95_000.0, step=10_000.0, format="%.0f",
+        )
+        eir = st.number_input(
+            "Effective interest rate (%)",
+            min_value=0.0, value=15.0, step=0.5, format="%.1f",
+        )
+
+    # Domain ratios (auto-computed)
+    loan_burden = price / annuity if annuity > 0 else np.nan
+    disbursed_ratio = disbursed / credit_amount if credit_amount > 0 else np.nan
+    debt_ratio = total_debt / (1 + credit_amount)
+    eir_ratio = eir / credit_amount if credit_amount > 0 else np.nan
+
+    FIELD_MAP: dict[str, float] = {
+        "credamount_770A": credit_amount,
+        "annuity_780A": annuity,
+        "price_1097A": price,
+        "totaldebt_9A": total_debt,
+        "disbursedcredamount_1113A": disbursed,
+        "eir_270L": eir,
+        "loan_burden_ratio": loan_burden,
+        "disbursed_credit_ratio": disbursed_ratio,
+        "debt_credit_ratio": debt_ratio,
+        "eir_credit_ratio": eir_ratio,
+    }
+
+    # ── Predict ───────────────────────────────────────────────────
+    if st.button("Predict Default Probability", type="primary", use_container_width=True):
+        row: dict = {}
+        for col in feature_cols:
+            if col in FIELD_MAP:
+                row[col] = FIELD_MAP[col]
+            elif col in cat_cols:
+                row[col] = None
+            else:
+                row[col] = np.nan
+
+        input_df = pd.DataFrame([row])[feature_cols]
+
+        fold_preds = [
+            float(m.predict_proba(input_df)[:, 1][0]) for m in models
+        ]
+        prob = float(np.clip(np.mean(fold_preds), 0, 1))
+        tier_label, tier_colour = _risk_tier(prob)
+
+        # ── Results ───────────────────────────────────────────────
+        st.markdown("---")
+        st.subheader("Prediction Results")
+
+        r1, r2 = st.columns(2)
+        r1.metric("Default Probability", f"{prob:.1%}")
+        r2.markdown(
+            f"### Risk Tier: "
+            f"<span style='color:{tier_colour};font-weight:bold;"
+            f"font-size:1.4em'>{tier_label}</span>",
+            unsafe_allow_html=True,
+        )
+
+        st.progress(min(prob, 1.0))
+
+        # Tier legend
+        tier_md = "  ".join(
+            f"<span style='color:{c}'>&bull; {l} (&lt;{int(t*100)}%)</span>"
+            for t, l, c in RISK_TIERS
+        )
+        st.markdown(tier_md, unsafe_allow_html=True)
+
+        # Per-fold detail
+        with st.expander("Per-fold model predictions"):
+            fold_df = pd.DataFrame({
+                "Fold": [f"Fold {i + 1}" for i in range(len(fold_preds))],
+                "Predicted Probability": fold_preds,
+            })
+            st.dataframe(
+                fold_df.style.format({"Predicted Probability": "{:.4%}"}),
+                use_container_width=True,
+            )
+
+        # Input summary
+        with st.expander("Input feature summary"):
+            summary = {
+                "Credit amount": f"{credit_amount:,.0f}",
+                "Monthly annuity": f"{annuity:,.0f}",
+                "Price of goods": f"{price:,.0f}",
+                "Total existing debt": f"{total_debt:,.0f}",
+                "Disbursed amount": f"{disbursed:,.0f}",
+                "Effective interest rate": f"{eir:.1f}%",
+                "Loan burden ratio (price / annuity)": f"{loan_burden:.4f}",
+                "Disbursed / credit ratio": f"{disbursed_ratio:.4f}",
+                "Debt / credit ratio": f"{debt_ratio:.4f}",
+                "EIR / credit ratio": f"{eir_ratio:.8f}",
+                "Features provided": f"{sum(1 for v in row.values() if v is not None and not (isinstance(v, float) and np.isnan(v)))} / {len(feature_cols)}",
+            }
+            for k, v in summary.items():
+                st.text(f"  {k:40s} {v}")
+
+
+# ═════════════════════════════════════════════════════════════════
 #  Sidebar & routing
 # ═════════════════════════════════════════════════════════════════
 
 st.sidebar.title("Credit Risk Model Stability")
-page = st.sidebar.radio("Navigate to", ["Data Drift", "Model Stability"])
+page = st.sidebar.radio(
+    "Navigate to", ["Data Drift", "Model Stability", "Risk Predictor"]
+)
 
 if page == "Data Drift":
     page_data_drift()
-else:
+elif page == "Model Stability":
     page_model_stability()
+else:
+    page_risk_predictor()
